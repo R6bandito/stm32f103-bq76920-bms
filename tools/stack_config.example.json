@@ -1,0 +1,32 @@
+{
+  "fpu": false,
+  "align_pad": false,
+  "rtos_context_bytes": 32,
+  "auto_isr": false,
+  "entries": {
+    "normal": ["Reset_Handler"],
+    "isr": ["SysTick_Handler", "PendSV_Handler", "HardFault_Handler"],
+    "thread": ["main_thread_entry", "rt_thread_idle_entry"]
+  },
+  "isr_priority": {
+    "HardFault_Handler": 0,
+    "SysTick_Handler": 15,
+    "PendSV_Handler": 15
+  },
+  "indirect_calls": {
+    "rt_components_init": ["$Super$$main"],
+    "rt_timer_check": ["_thread_timeout"]
+  },
+  "frame_override": {
+  },
+  "ignore_functions": [
+    "__printf*",
+    "_printf*"
+  ],
+  "limits": {
+    "Reset_Handler": 512,
+    "main_thread_entry": 1024,
+    "rt_thread_idle_entry": 256
+  },
+  "msp_limit": 1024
+}
