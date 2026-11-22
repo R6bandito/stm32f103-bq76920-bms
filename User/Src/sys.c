@@ -1,125 +1,22 @@
 #include "sys.h"
-#include <stdio.h>
-#include <stdint.h>
 #include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "rtthread.h"
 
-/* ARMCC standard-library retargeting; all definitions stay in this file. */
-#if defined(__ARMCC_VERSION) && !defined(__MICROLIB)
+/* Reject any Arm C library dependency that needs a debugger host call. */
+#if defined(__CC_ARM)
 #pragma import(__use_no_semihosting)
-#include <rt_sys.h>
-#include <string.h>
 
-struct __FILE { int handle; };
-FILE __stdin = { 0 };
-FILE __stdout = { 1 };
-FILE __stderr = { 2 };
-const char __stdin_name[] = "STDIN";
-const char __stdout_name[] = "STDOUT";
-const char __stderr_name[] = "STDERR";
-
-FILEHANDLE _sys_open(const char *name, int openmode)
-{
-    (void)openmode;
-    if (name == NULL) return -1;
-    if (strcmp(name, __stdin_name) == 0) return 0;
-    if (strcmp(name, __stdout_name) == 0) return 1;
-    if (strcmp(name, __stderr_name) == 0) return 2;
-    return -1;
-}
-
-int _sys_close(FILEHANDLE fh)
-{
-    return (fh >= 0 && fh <= 2) ? 0 : -1;
-}
-
-int _sys_write(FILEHANDLE fh, const unsigned char *buf, unsigned len, int mode)
-{
-    unsigned i;
-    FILE *stream;
-    (void)mode;
-    if (fh != 1 && fh != 2) return -1;
-    stream = (fh == 1) ? &__stdout : &__stderr;
-    for (i = 0; i < len; ++i) {
-        if (fputc(buf[i], stream) == EOF) return (int)(len - i);
-    }
-    return 0; /* ARM ABI: number of bytes NOT written. */
-}
-
-int _sys_read(FILEHANDLE fh, unsigned char *buf, unsigned len, int mode)
-{
-    (void)buf; (void)mode;
-    return (fh == 0) ? (int)len : -1; /* No data read: EOF. */
-}
-
-int _sys_istty(FILEHANDLE fh)
-{
-    return (fh >= 0 && fh <= 2);
-}
-
-int _sys_seek(FILEHANDLE fh, long pos)
-{
-    (void)fh; (void)pos;
-    return -1;
-}
-
-int _sys_ensure(FILEHANDLE fh)
-{
-    return (fh >= 0 && fh <= 2) ? 0 : -1;
-}
-
-long _sys_flen(FILEHANDLE fh)
-{
-    (void)fh;
-    return -1L;
-}
-
-int _sys_tmpnam(char *name, int sig, unsigned maxlen)
-{
-    (void)sig;
-    if (name != NULL && maxlen != 0U) name[0] = '\0';
-    return 0; /* ARM ABI: zero means failure here. */
-}
-
-char *_sys_command_string(char *cmd, int len)
-{
-    if (cmd == NULL || len <= 0) return NULL;
-    cmd[0] = '\0';
-    return cmd;
-}
-
-void _ttywrch(int ch)
-{
-    (void)ch; /* Last-resort output not implemented. */
-}
-
+/* ARMCC startup/exit ABI. This terminal handler only executes locally. */
 void _sys_exit(int returncode)
 {
     (void)returncode;
-    /* This ABI function must not return. No debugger operation is used. */
-    for (;;) { __NOP(); }
+    for (;;) {
+        __NOP();
+    }
 }
-
-int fgetc(FILE *stream)
-{
-    (void)stream;
-    return EOF;
-}
-
-int ferror(FILE *stream)
-{
-    (void)stream;
-    return 0;
-}
-#endif /* ARM standard library */
-
-/* TODO: bounded UART output goes here. Do not call printf recursively or
- * depend on the masked SysTick for a transmit timeout. No output backend yet.
- */
-int fputc(int ch, FILE *stream)
-{
-    (void)ch; (void)stream;
-    return EOF;
-}
+#endif
 
 #define STARTUP_HCLK_HZ     8000000UL
 #define TARGET_HCLK_HZ     72000000UL
@@ -127,17 +24,17 @@ int fputc(int ch, FILE *stream)
 #define PLL_TIMEOUT_US        10000UL
 #define SWITCH_TIMEOUT_US     10000UL
 #define HSI_OFF_TIMEOUT_US    10000UL
-
+#define LOG_BUFFER_SIZE       128u
+#define LOG_SLOT_COUNT        2u
+#define LOG_MB_WAIT_MS        50u
+#define LOG_TX_TIMEOUT_MS     50u
 
 static UART_HandleTypeDef huart1;
+static rt_mailbox_t mb_freeBox;
+static rt_mailbox_t mb_messageReq;
 
-static const char *s_log_level_str[] = {
-    "DEBUG",
-    "INFO",
-    "WARN",
-    "ERROR"
-};
-#define LOG_BUFFER_SIZE         (128u)
+static uint8_t TxBuff_1[LOG_BUFFER_SIZE];
+static uint8_t TxBuff_2[LOG_BUFFER_SIZE];
 
 /* These overrides, if present, must also match the CMSIS system file. */
 #if defined(HSE_VALUE)
@@ -169,19 +66,115 @@ static int Clock_WaitBits(volatile uint32_t *reg, uint32_t mask,
     return 1;
 }
 
-HAL_StatusTypeDef system_log_print( LogLevel_t level, const char *file, int line, const char *fmt, ... ) {
-    if ( level > LOG_LEVEL_ERROR || !file || !fmt )
+HAL_StatusTypeDef SystemConsoleMailboxInit( void ) {
+    rt_mailbox_t free_box;
+    rt_mailbox_t message_req;
+
+    if (mb_freeBox != RT_NULL && mb_messageReq != RT_NULL)
+        return HAL_OK;
+
+    free_box = rt_mb_create("freebox", LOG_SLOT_COUNT, RT_IPC_FLAG_PRIO);
+    if (free_box == RT_NULL)
         return HAL_ERROR;
-    
-    char buffer[LOG_BUFFER_SIZE] = { 0 };
+
+    message_req = rt_mb_create("messagebox", LOG_SLOT_COUNT, RT_IPC_FLAG_PRIO);
+    if (message_req == RT_NULL) {
+        rt_mb_delete(free_box);
+        return HAL_ERROR;
+    }
+
+    if (rt_mb_send(free_box, 1u) != RT_EOK || rt_mb_send(free_box, 2u) != RT_EOK) {
+        rt_mb_delete(message_req);
+        rt_mb_delete(free_box);
+        return HAL_ERROR;
+    }
+
+    mb_freeBox = free_box;
+    mb_messageReq = message_req;
+    return HAL_OK;
+}
+
+static void mailbox_release( rt_ubase_t index ) {
+    if (index != 1u && index != 2u)
+        return;
+    rt_mb_send(mb_freeBox, index);
+}
+
+/* Blocking register TX for the dedicated USART1 worker. */
+static HAL_StatusTypeDef ConsoleSend(const char *data, uint32_t len)
+{
+    USART_TypeDef *uart = CONSOLE_UART_INSTANCE;
+    const uint32_t timeout = (SystemCoreClock / 1000u) * LOG_TX_TIMEOUT_MS;
+    const uint32_t start = DWT_GetCount();
+    uint32_t polls_left = timeout;
+    uint32_t i;
+    if ((RCC->APB2ENR & RCC_APB2ENR_USART1EN) == 0u ||      /* 串口未正确初始化. 返回. */
+        (uart->CR1 & (USART_CR1_UE | USART_CR1_TE)) != (USART_CR1_UE | USART_CR1_TE)) {
+        return HAL_ERROR;
+    }
+
+    for (i = 0u; i <= len; ++i) {
+        const uint32_t flag = (i < len) ? USART_SR_TXE : USART_SR_TC;
+        while ((uart->SR & flag) == 0u) {
+            if (DWT_Elapsed(start) >= timeout || polls_left == 0u)
+                return HAL_TIMEOUT;
+            --polls_left;
+        }
+        if (i < len)
+            uart->DR = (uint8_t)data[i];
+    }
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef system_log_print( LogLevel_t level, const char *file, int line, const char *fmt, ... ) {
+    static const char *const level_name[] = {"DEBUG", "INFO", "WARN", "ERROR"};
+    uint32_t len;
+    int written;
     va_list args;
-    va_start( args, fmt );
+    rt_ubase_t box;
+    rt_err_t stat;
+    uint8_t *buffer;
+    rt_uint32_t message;
+    const uint32_t text_capacity = LOG_BUFFER_SIZE - 2u; /* Includes the text NUL. */
 
-    int len = vsnprintf( buffer, LOG_BUFFER_SIZE, fmt, args );
-    if ( len < 0 ) return HAL_ERROR;
-    va_end( args );
+    if ((unsigned)level >= sizeof(level_name) / sizeof(level_name[0]) || !file || !fmt ||
+        mb_freeBox == RT_NULL || mb_messageReq == RT_NULL)
+        return HAL_ERROR;
 
-    printf("[%s] (%s:%d): %s\r\n", s_log_level_str[level], file, line, buffer);
+    stat = rt_mb_recv(mb_freeBox, &box, rt_tick_from_millisecond(LOG_MB_WAIT_MS));
+    if (stat != RT_EOK)
+        return (stat == -RT_ETIMEOUT) ? HAL_TIMEOUT : HAL_ERROR;
+    if (box == 1u)
+        buffer = TxBuff_1;
+    else if (box == 2u)
+        buffer = TxBuff_2;
+    else
+        return HAL_ERROR;
+
+    written = snprintf((char *)buffer, text_capacity, "[%s] (%s:%d): ", level_name[level], file, line);
+    if (written < 0)
+        goto release_slot;
+    len = ((uint32_t)written < text_capacity) ? (uint32_t)written : text_capacity - 1u;
+
+    va_start(args, fmt);
+    written = vsnprintf((char *)(buffer + len), text_capacity - len, fmt, args);
+    va_end(args);
+    if (written < 0)
+        goto release_slot;
+    len += ((uint32_t)written < text_capacity - len) ? (uint32_t)written : text_capacity - len - 1u;
+    buffer[len++] = '\r';
+    buffer[len++] = '\n';
+    buffer[len] = '\0';
+
+    message = ((rt_uint32_t)(box << 16u) | len);
+    stat = rt_mb_send(mb_messageReq, message);
+    if (stat != RT_EOK)
+        goto release_slot;
+    return HAL_OK;
+
+release_slot:
+    mailbox_release(box);
+    return HAL_ERROR;
 }
 
 SysClockStatus SystemCoreClock_Set_72Mhz(void)
@@ -194,7 +187,6 @@ SysClockStatus SystemCoreClock_Set_72Mhz(void)
         (RCC->CR & (RCC_CR_HSION | RCC_CR_HSIRDY)) !=
                    (RCC_CR_HSION | RCC_CR_HSIRDY)) {
         /* 系统时钟设置调用发生在系统正常工况时期,不响应在运行中切频的调用. */
-        printf( "[ERROR] Error Param. Files: %s, Lines: %d\n", __FILE__, __LINE__ );
         return SYS_CLOCK_INVALID_STARTUP_STATE;
     }
 
@@ -203,7 +195,6 @@ SysClockStatus SystemCoreClock_Set_72Mhz(void)
                  FLASH_ACR_LATENCY_2 | FLASH_ACR_PRFTBE;
     if ((FLASH->ACR & FLASH_ACR_LATENCY) != FLASH_ACR_LATENCY_2) {
         status = SYS_CLOCK_FLASH_ERROR;
-        printf( "[ERROR] Flash latency set fail. Files: %s, Lines: %d\n", __FILE__, __LINE__ );
         goto finish;
     }
 
@@ -214,7 +205,6 @@ SysClockStatus SystemCoreClock_Set_72Mhz(void)
                         STARTUP_HCLK_HZ, HSE_TIMEOUT_US)) {
         RCC->CR &= ~RCC_CR_HSEON;
         status = SYS_CLOCK_HSE_TIMEOUT;
-        printf( "[ERROR] HSE response error. Files: %s, Lines: %d\n", __FILE__, __LINE__ );
         goto finish;
     }
     /* APB1 /2 BEFORE switching: PCLK1 must not exceed 36MHz.
@@ -229,7 +219,6 @@ SysClockStatus SystemCoreClock_Set_72Mhz(void)
                         STARTUP_HCLK_HZ, PLL_TIMEOUT_US)) {
         /* SYSCLK is still HSI. Do not add another unbounded shutdown wait. */
         RCC->CR &= ~RCC_CR_PLLON;
-        printf( "[ERROR] PLL response error. Files: %s, Lines: %d\n", __FILE__, __LINE__ );
         status = SYS_CLOCK_PLL_TIMEOUT;
         goto finish;
     }
@@ -267,7 +256,6 @@ finish:
 HAL_StatusTypeDef SystemDebugUart_Init( uint32_t baudrate ) {
     if ( baudrate > BAUDRATE_921600 ) 
         return HAL_ERROR;
-
     uint32_t baud;
     switch (baudrate)
     {
@@ -320,7 +308,6 @@ HAL_StatusTypeDef SystemDebugUart_Init( uint32_t baudrate ) {
 
     return HAL_OK;
 }
-
 
 UART_HandleTypeDef *GetConsoleHandle( void ) {
     return &huart1;

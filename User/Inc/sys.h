@@ -36,6 +36,8 @@ typedef enum {
 #define CONSOLE_UART_CLK_EN()       do { __HAL_RCC_USART1_CLK_ENABLE(); } while(0)
 #define CONSOLE_UART_IO_PORT_EN()   do { __HAL_RCC_GPIOA_CLK_ENABLE(); } while(0)
 
+/* 在 main 中完成邮箱初始化后，线程才能提交日志。 */
+HAL_StatusTypeDef SystemConsoleMailboxInit( void );
 HAL_StatusTypeDef system_log_print( LogLevel_t level, const char *file, int line, const char *fmt, ... );
 #define LOG_INFO(fmt, ...)  system_log_print(LOG_LEVEL_INFO, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 #define LOG_DEBUG(fmt, ...)  system_log_print(LOG_LEVEL_DEBUG, __FILE__, __LINE__, fmt, ##__VA_ARGS__)

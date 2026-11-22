@@ -1155,6 +1155,16 @@
               <FileType>5</FileType>
               <FilePath>.\BMSCore\AFE_Core.h</FilePath>
             </File>
+            <File>
+              <FileName>bms_app.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\BMSCore\bms_app.c</FilePath>
+            </File>
+            <File>
+              <FileName>bms_app.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\BMSCore\bms_app.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
