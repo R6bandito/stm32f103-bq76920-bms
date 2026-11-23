@@ -2,18 +2,30 @@
  * Board clocks, debug UART, DWT, heap and RT tick are initialized beforehand.
  */
 #include "rtthread.h"
-#include "AFE_Test.h"
 #include "sys.h"
+#include "bms_app.h"
 
 int main( void ) {
-    if (SystemConsoleMailboxInit() != HAL_OK)
+    HAL_StatusTypeDef res;
+    /* The sampling thread can report an AFE initialization failure immediately. */
+    res = Bms_FaultThreadCreate();
+    if (res != HAL_OK)
         return 1;
 
-    /* No application workers yet. Returning ends only the main thread;
-     * the RT-Thread scheduler and idle thread remain active.
-     */
-    AFE_Test_Run(20);
+    res = Bms_SampleTaskCreate();
+    if (res != HAL_OK)
+        return 1;
+
+    if (SystemConsoleMailboxInit() == HAL_OK) {
+        /* Logging is optional. The start routine cleans up on failure. */
+        (void)SystemConsoleThreadStart();
+    }
+
+    res = Bms_ConsoleThreadCreate();
+    if (res != HAL_OK)
+        LOG_ERROR("BmsConsoleThread Start Failed!");
+
     while(1) {
-        rt_thread_mdelay(1000);
+        rt_thread_mdelay(2000u);
     }
 }

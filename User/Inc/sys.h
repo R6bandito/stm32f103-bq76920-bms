@@ -1,5 +1,6 @@
 #ifndef __SYS_H__
 #define __SYS_H__
+#include <stddef.h>
 #include "stm32f1xx.h"
 #include "dwt.h"  /* Re-export the shared cycle-counter API. */
 
@@ -36,10 +37,12 @@ typedef enum {
 #define CONSOLE_UART_CLK_EN()       do { __HAL_RCC_USART1_CLK_ENABLE(); } while(0)
 #define CONSOLE_UART_IO_PORT_EN()   do { __HAL_RCC_GPIOA_CLK_ENABLE(); } while(0)
 
-/* 在 main 中完成邮箱初始化后，线程才能提交日志。 */
+/* 在 main 中依次初始化邮箱、启动发送线程，再允许提交日志。 */
 HAL_StatusTypeDef SystemConsoleMailboxInit( void );
+HAL_StatusTypeDef SystemConsoleThreadStart( void );
+/* file 为 NULL 时省略源码位置。 */
 HAL_StatusTypeDef system_log_print( LogLevel_t level, const char *file, int line, const char *fmt, ... );
-#define LOG_INFO(fmt, ...)  system_log_print(LOG_LEVEL_INFO, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  system_log_print(LOG_LEVEL_INFO, NULL, 0, fmt, ##__VA_ARGS__)
 #define LOG_DEBUG(fmt, ...)  system_log_print(LOG_LEVEL_DEBUG, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...)  system_log_print(LOG_LEVEL_WARN, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...)  system_log_print(LOG_LEVEL_ERROR,  __FILE__, __LINE__, fmt, ##__VA_ARGS__)

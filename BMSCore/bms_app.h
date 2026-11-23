@@ -4,10 +4,24 @@
 #include "stm32f1xx_hal.h"
 #include "AFE_Core.h"
 
-#define  BMS_SAMPLE_BASE_PERIOD_MS          (100u)
-#define  BMS_VOLTAGE_SAMPLE_PERIOD_MS       (300u)
-#define  BMS_CURRENT_SAMPLE_PERIOD_MS       (300u)
+#define  BMS_SAMPLE_BASE_PERIOD_MS          (250u)
+#define  BMS_VOLTAGE_SAMPLE_PERIOD_MS       (250u)
+#define  BMS_STATUS_SAMPLE_PERIOD_MS        (250u)
+#define  BMS_CURRENT_SAMPLE_PERIOD_MS       (2000u)
 #define  BMS_TEMP_SAMPLE_PERIOD_MS          (3000u)
+#define  BMS_CONSOLE_PERIOD_MS              (1000u)
+
+#define BMS_FAULT_EVENT_GENERIC_UPLOAD      (0x01u)
+#define BMS_FAULT_EVENT_INIT_FAIL           (0x02u)
+
+#define FAULT_MASK_OCD                      (0x01u)
+#define FAULT_MASK_SCD                      (0x01u << 1)
+#define FAULT_MASK_OV                       (0x01u << 2)
+#define FAULT_MASK_UV                       (0x01u << 3)
+#define FAULT_MASK_DEVICE_XREADY            (0x01u << 4)
+#define FAULT_MASK_OVRD_ALERT               (0x01u << 5)
+#define FAULT_MASK_ALL                      (FAULT_MASK_OCD | FAULT_MASK_SCD | FAULT_MASK_OV | FAULT_MASK_UV \
+                                                | FAULT_MASK_DEVICE_XREADY | FAULT_MASK_OVRD_ALERT)
 
 
 /* 采样快照约定（适用于单体电压、电流、温度和 SYS_STAT）。
@@ -47,6 +61,8 @@ typedef struct {
 
 /* 由启动线程调用一次，HAL_OK 表示采样线程已启动。 */
 HAL_StatusTypeDef Bms_SampleTaskCreate( void );
+HAL_StatusTypeDef Bms_ConsoleThreadCreate( void );
+HAL_StatusTypeDef Bms_FaultThreadCreate( void );
 
 /* 在线程中调用。HAL_OK 表示已写回完成有效期检查的快照。
  * 建议为每个调用方使用独立的输出对象。共享输出时，由调用方同步各处的读写。

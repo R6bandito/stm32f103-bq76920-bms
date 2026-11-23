@@ -33,6 +33,12 @@ static UART_HandleTypeDef huart1;
 static rt_mailbox_t mb_freeBox;
 static rt_mailbox_t mb_messageReq;
 
+static rt_thread_t log_thread;
+static volatile rt_uint16_t log_thread_err_cnt;
+static const rt_uint32_t log_thread_stacksize = 256u;
+static const rt_uint8_t log_thread_priority = 16u;
+static const rt_uint32_t log_thread_tick = 10u;
+
 static uint8_t TxBuff_1[LOG_BUFFER_SIZE];
 static uint8_t TxBuff_2[LOG_BUFFER_SIZE];
 
@@ -126,6 +132,63 @@ static HAL_StatusTypeDef ConsoleSend(const char *data, uint32_t len)
     return HAL_OK;
 }
 
+static void sys_log_thread( void *parameter ) {
+    (void)parameter;
+    rt_ubase_t rcv;
+    rt_uint32_t index;
+    rt_uint32_t length;
+    const uint8_t *buf;
+    HAL_StatusTypeDef res;
+    for(;;) {
+        if (rt_mb_recv(mb_messageReq, &rcv, RT_WAITING_FOREVER) != RT_EOK) {
+            ++log_thread_err_cnt;
+            continue;
+        }
+        index = rcv >> 16u;
+        length = rcv & 0xFFFFu;
+        if (index == 1u)
+            buf = TxBuff_1;
+        else if (index == 2u)
+            buf = TxBuff_2;
+        else {
+            ++log_thread_err_cnt;
+            continue;
+        }
+
+        res = HAL_ERROR;
+        if (length > 0u && length < LOG_BUFFER_SIZE)
+            res = ConsoleSend((const char *)buf, length);
+        if (res != HAL_OK)
+            ++log_thread_err_cnt;
+        mailbox_release((rt_ubase_t)index);
+    }
+}
+
+HAL_StatusTypeDef SystemConsoleThreadStart( void ) {
+    rt_thread_t thread;
+
+    if (log_thread != RT_NULL)
+        return HAL_OK;
+    if (mb_freeBox == RT_NULL || mb_messageReq == RT_NULL)
+        return HAL_ERROR;
+
+    thread = rt_thread_create("log_thread", sys_log_thread, RT_NULL,
+                              log_thread_stacksize, log_thread_priority, log_thread_tick);
+    if (thread != RT_NULL) {
+        if (rt_thread_startup(thread) == RT_EOK) {
+            log_thread = thread;
+            return HAL_OK;
+        }
+        rt_thread_delete(thread);
+    }
+
+    rt_mb_delete(mb_messageReq);
+    rt_mb_delete(mb_freeBox);
+    mb_messageReq = RT_NULL;
+    mb_freeBox = RT_NULL;
+    return HAL_ERROR;
+}
+
 HAL_StatusTypeDef system_log_print( LogLevel_t level, const char *file, int line, const char *fmt, ... ) {
     static const char *const level_name[] = {"DEBUG", "INFO", "WARN", "ERROR"};
     uint32_t len;
@@ -137,8 +200,8 @@ HAL_StatusTypeDef system_log_print( LogLevel_t level, const char *file, int line
     rt_uint32_t message;
     const uint32_t text_capacity = LOG_BUFFER_SIZE - 2u; /* Includes the text NUL. */
 
-    if ((unsigned)level >= sizeof(level_name) / sizeof(level_name[0]) || !file || !fmt ||
-        mb_freeBox == RT_NULL || mb_messageReq == RT_NULL)
+    if ((unsigned)level >= sizeof(level_name) / sizeof(level_name[0]) || !fmt ||
+        log_thread == RT_NULL)
         return HAL_ERROR;
 
     stat = rt_mb_recv(mb_freeBox, &box, rt_tick_from_millisecond(LOG_MB_WAIT_MS));
@@ -151,7 +214,10 @@ HAL_StatusTypeDef system_log_print( LogLevel_t level, const char *file, int line
     else
         return HAL_ERROR;
 
-    written = snprintf((char *)buffer, text_capacity, "[%s] (%s:%d): ", level_name[level], file, line);
+    if (file != NULL)
+        written = snprintf((char *)buffer, text_capacity, "[%s] (%s:%d): ", level_name[level], file, line);
+    else
+        written = snprintf((char *)buffer, text_capacity, "[%s] ", level_name[level]);
     if (written < 0)
         goto release_slot;
     len = ((uint32_t)written < text_capacity) ? (uint32_t)written : text_capacity - 1u;
