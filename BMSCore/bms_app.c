@@ -3,11 +3,36 @@
 #include "rtthread.h"
 #include "sys.h"
 
-static const rt_uint32_t bms_sample_thread_stack_size = 1024u;
-static const rt_uint8_t bms_sample_thread_priority = 15u;
-static const rt_uint32_t bms_sample_thread_tick = 10u;
+#define BMS_AFE_COMMAND_QUEUE_DEPTH          (4u)
+#define BMS_FAULT_REQUEST_QUEUE_DEPTH        (4u)
+#define BMS_FAULT_REPLY_TIMEOUT_MS            (2000u)
+#define BMS_FAULT_MAX_RETRIES                 (5u)
+#define BMS_AFE_FET_ENABLE_MASK              (0x03u)
+#define BMS_AFE_CELLBAL_ENABLE_MASK          (0x1Fu)
+
+typedef enum {
+    BMS_AFE_CMD_VERIFY_OUTPUTS = 1
+} BmsAfeCommandType_t;
+
+typedef union {
+    struct {
+        uint32_t timeout_ms;
+    } verify_outputs;
+} BmsAfeCommandArgs_t;
+
+typedef struct {    /* IO线程控制命令结构. */
+    BmsAfeCommandType_t type;
+    uint8_t request_id;
+    BmsAfeCommandArgs_t args;
+} BmsAfeCommand_t;
+
+static const rt_uint32_t bms_afe_io_thread_stack_size = 1024u;
+static const rt_uint8_t bms_afe_io_thread_priority = 15u;
+static const rt_uint32_t bms_afe_io_thread_tick = 10u;
 static const uint32_t bms_afe_timeout_ms = 20u;
-static rt_thread_t bms_sample_thread;
+static rt_thread_t bms_afe_io_thread;
+static rt_mq_t bms_afe_command_queue;
+static uint8_t bms_afe_last_request_id;
 
 static const rt_uint32_t bms_console_thread_stack_size = 512u;
 static const rt_uint8_t bms_console_thread_priority = 15u;
@@ -19,6 +44,46 @@ static const rt_uint8_t bms_fault_thread_priority = 12u;
 static const rt_uint32_t bms_fault_thread_tick = 10u;
 static rt_thread_t bms_fault_thread;
 static rt_mailbox_t fault_mailbox;
+
+typedef struct {
+    uint8_t isXReady_Triggerd;  /* 只有在Triggerd标志置位情况下, Tick才有效. */
+    uint32_t XReady_Triggerd_Tick;
+
+    uint8_t isOCD_Triggerd;
+    uint32_t OCD_Triggerd_Tick;
+
+    uint8_t isSCD_Triggerd;
+    uint32_t SCD_Triggerd_Tick;
+
+    uint8_t isOV_Triggerd;
+    uint32_t OV_Triggerd_Tick;
+
+    uint8_t isUV_Triggerd;
+    uint32_t UV_Triggerd_Tick;
+
+    uint8_t isOVRD_ALERT_Triggerd;
+    uint32_t OVRD_ALERT_Triggerd_Tick;
+} GlobalError_t;
+static GlobalError_t ErrorPacket;
+
+typedef struct {
+    BmsAfeCommandType_t type;
+    BmsAfeCommandArgs_t args;
+} BmsFaultRequest_t;
+
+typedef struct {
+    uint8_t request_id;
+    uint8_t retry_count;
+    rt_bool_t pending;
+    rt_tick_t submitted_tick;
+} BmsFaultTransaction_t;
+
+/* 仅由故障线程访问，队首保留到事务结束。 */
+static BmsFaultRequest_t bms_fault_requests[BMS_FAULT_REQUEST_QUEUE_DEPTH];
+static uint8_t bms_fault_request_read;
+static uint8_t bms_fault_request_write;
+static uint8_t bms_fault_request_count;
+static BmsFaultTransaction_t bms_fault_transaction;
 
 /* 每项数据的有效期为其读取周期的三倍。 */
 #define BMS_SAMPLE_MAX_AGE_PERIODS (3u)
@@ -50,8 +115,62 @@ static void bms_publish_snapshot(const BatteryPackInfo_t *snapshot) {
     rt_exit_critical();
 }
 
-static void Bms_Sample_Thread( void *parameter ) {
-    (void)parameter;
+HAL_StatusTypeDef Bms_AfeRequestVerifyOutputs(uint32_t timeout_ms, uint8_t *request_id_out) {
+    rt_err_t result;
+    BmsAfeCommand_t command = {
+        .type = BMS_AFE_CMD_VERIFY_OUTPUTS,
+        .args.verify_outputs = { .timeout_ms = timeout_ms }
+    };
+    if (request_id_out == RT_NULL || timeout_ms == 0u || timeout_ms > bms_afe_timeout_ms ||
+            bms_afe_command_queue == RT_NULL || bms_fault_thread == RT_NULL)
+        return HAL_ERROR;
+
+    /* 取号和无阻塞入队一起完成，8 位序号按入队顺序递增。 */
+    rt_enter_critical();
+    command.request_id = (uint8_t)(bms_afe_last_request_id + 1u);
+    result = rt_mq_send(bms_afe_command_queue, &command, sizeof(command));
+    if (result == RT_EOK) {
+        bms_afe_last_request_id = command.request_id;
+        *request_id_out = command.request_id;
+    }
+    rt_exit_critical();
+
+    if (result == RT_EOK)
+        return HAL_OK;
+    return (result == -RT_EFULL) ? HAL_BUSY : HAL_ERROR;
+}
+
+static void bms_afe_process_command(rt_mq_t command_queue, rt_int32_t wait_ticks) {
+    BmsAfeCommand_t command;
+    if (rt_mq_recv(command_queue, &command, sizeof(command), wait_ticks) != RT_EOK)
+        return;
+    switch (command.type) {
+        case BMS_AFE_CMD_VERIFY_OUTPUTS: {
+            uint8_t sys_ctrl2;
+            uint8_t cellbal1;
+            rt_ubase_t event;
+            const AFEState_t result = AFE_ReadOutputState(&sys_ctrl2, &cellbal1, command.args.verify_outputs.timeout_ms);
+
+            /* 类型 [31:28]，请求号 [23:16]，返回码 [15:8]。
+             * 低字节的 bit 0/1 是 CHG/DSG，bit 2～6 是均衡位。
+             */
+            event = ((rt_ubase_t)BMS_FAULT_EVENT_VERIFY_OUTPUTS_RESULT << 28u) |
+                    ((rt_ubase_t)command.request_id << 16u) |
+                    ((rt_ubase_t)result << 8u);
+            if (result == AFE_EOK) {
+                event |= (sys_ctrl2 & BMS_AFE_FET_ENABLE_MASK) |
+                         ((cellbal1 & BMS_AFE_CELLBAL_ENABLE_MASK) << 2u);
+            }
+            if (rt_mb_send(fault_mailbox, event) != RT_EOK)
+                LOG_WARN("AFE output readback reply lost. id=%u", (unsigned)command.request_id);
+            break;
+        }
+        default:    break;
+    }
+}
+
+static void Bms_AfeIo_Thread( void *parameter ) {
+    rt_mq_t command_queue = (rt_mq_t)parameter;
     BatteryPackInfo_t sample = SnapShot;
     const rt_tick_t base_ticks = rt_tick_from_millisecond(BMS_SAMPLE_BASE_PERIOD_MS);
     rt_tick_t last_wakeup;
@@ -69,7 +188,7 @@ static void Bms_Sample_Thread( void *parameter ) {
             (void)rt_mb_send(fault_mailbox, init_event);
         }
         for (;;) {
-            rt_thread_mdelay(1000);
+            bms_afe_process_command(command_queue, RT_WAITING_FOREVER);
         }
     }
 
@@ -78,7 +197,6 @@ static void Bms_Sample_Thread( void *parameter ) {
         uint8_t publish = 0u;
         rt_ubase_t fault_thread_event = 0u;
         uint32_t cell;
-
         rt_thread_delay_until(&last_wakeup, base_ticks);
 
         if (++voltage_count >= BMS_VOLTAGE_SAMPLE_PERIOD_MS / BMS_SAMPLE_BASE_PERIOD_MS) {
@@ -142,21 +260,33 @@ static void Bms_Sample_Thread( void *parameter ) {
                 (void)rt_mb_send(fault_mailbox, fault_thread_event);
             }
         }
+        bms_afe_process_command(command_queue, 0);      /* 处理用户上层的命令. */
     }
 }
 
-HAL_StatusTypeDef Bms_SampleTaskCreate( void ) {
-    if (bms_sample_thread != RT_NULL)   /* 线程启动方法.不允许重入. */
+HAL_StatusTypeDef Bms_AfeIoThreadCreate( void ) {
+    rt_mq_t command_queue;
+    rt_thread_t thread;
+    if (bms_afe_io_thread != RT_NULL)   /* 线程正常运行时不允许重入. */
         return HAL_BUSY;
-    bms_sample_thread = rt_thread_create("bms_sample", Bms_Sample_Thread, NULL, 
-                            bms_sample_thread_stack_size, bms_sample_thread_priority, bms_sample_thread_tick);
-    if (bms_sample_thread == RT_NULL) 
+    command_queue = rt_mq_create("afe_cmd", sizeof(BmsAfeCommand_t),
+                                    BMS_AFE_COMMAND_QUEUE_DEPTH, RT_IPC_FLAG_FIFO);
+    if (command_queue == RT_NULL)
         return HAL_ERROR;
-    if (rt_thread_startup(bms_sample_thread) != RT_EOK) {
-        rt_thread_delete(bms_sample_thread);
-        bms_sample_thread = RT_NULL;
+
+    thread = rt_thread_create("afe_io", Bms_AfeIo_Thread, command_queue,
+                                bms_afe_io_thread_stack_size, bms_afe_io_thread_priority, bms_afe_io_thread_tick);
+    if (thread == RT_NULL) {
+        rt_mq_delete(command_queue);
         return HAL_ERROR;
     }
+    if (rt_thread_startup(thread) != RT_EOK) {
+        rt_thread_delete(thread);
+        rt_mq_delete(command_queue);
+        return HAL_ERROR;
+    }
+    bms_afe_io_thread = thread;
+    bms_afe_command_queue = command_queue;
     return HAL_OK;
 }
 
@@ -273,13 +403,74 @@ static rt_uint32_t bms_evaluate(uint8_t sys_stat) {
     return mask;
 }
 
+static rt_bool_t bms_fault_enqueue_request(const BmsFaultRequest_t *request) {
+    if (bms_fault_request_count == BMS_FAULT_REQUEST_QUEUE_DEPTH)
+        return RT_FALSE;
+    bms_fault_requests[bms_fault_request_write] = *request;
+    bms_fault_request_write = (bms_fault_request_write + 1u) % BMS_FAULT_REQUEST_QUEUE_DEPTH;
+    ++bms_fault_request_count;
+    return RT_TRUE;
+}
+
+static void bms_fault_finish_request(void) {
+    bms_fault_request_read = (bms_fault_request_read + 1u) % BMS_FAULT_REQUEST_QUEUE_DEPTH;
+    --bms_fault_request_count;
+    bms_fault_transaction = (BmsFaultTransaction_t){0};
+}
+
+static void bms_fault_service_requests(void) {
+    HAL_StatusTypeDef result;
+    const BmsFaultRequest_t *request;
+    if (bms_fault_transaction.pending) {        /* 如果pending已经置位，且Elapsed过期.说明对端回复超时(FaultThread未收到正确响应.) */
+        const rt_tick_t elapsed = rt_tick_get() - bms_fault_transaction.submitted_tick;
+        if (elapsed < (rt_tick_t)rt_tick_from_millisecond(BMS_FAULT_REPLY_TIMEOUT_MS))
+            return;
+        LOG_ERROR("AFE fault request reply timed out. id=%u", (unsigned)bms_fault_transaction.request_id);
+        bms_fault_finish_request();
+    }
+    if (bms_fault_request_count == 0u)  /* 队列已空. 直接返回. */
+        return;
+
+    request = &bms_fault_requests[bms_fault_request_read];
+    switch (request->type) {
+        case BMS_AFE_CMD_VERIFY_OUTPUTS:
+            result = Bms_AfeRequestVerifyOutputs(request->args.verify_outputs.timeout_ms, &bms_fault_transaction.request_id);
+            break;
+        default:
+            result = HAL_ERROR;
+            break;
+    }
+    if (result == HAL_OK) {
+        bms_fault_transaction.submitted_tick = rt_tick_get();
+        bms_fault_transaction.pending = RT_TRUE;
+    } else if (result != HAL_BUSY) {
+        LOG_ERROR("AFE fault request enqueue failed. type=%u rc=%u", (unsigned)request->type, (unsigned)result);
+        bms_fault_finish_request();
+    }
+}
+
 /* 故障处理入口，具体动作待接入。 */
 static void bms_error_ocd_handler(void) {}
 static void bms_error_scd_handler(void) {}
 static void bms_error_ov_handler(void) {}
+
 static void bms_error_uv_handler(void) {}
-static void bms_error_device_xready_handler(void) {}
-static void bms_error_ovrd_alert_handler(void) {}
+
+static void bms_error_ovrd_alert_handler(void) {
+    ErrorPacket.isOVRD_ALERT_Triggerd = 1;
+    ErrorPacket.OVRD_ALERT_Triggerd_Tick = rt_tick_get();
+}
+
+static void bms_error_device_xready_handler(void) {
+    const BmsFaultRequest_t request = {
+        .type = BMS_AFE_CMD_VERIFY_OUTPUTS,
+        .args.verify_outputs = { .timeout_ms = bms_afe_timeout_ms }
+    };
+    ErrorPacket.isXReady_Triggerd = 1u;
+    ErrorPacket.XReady_Triggerd_Tick = rt_tick_get();
+    if (!bms_fault_enqueue_request(&request))
+        LOG_ERROR("Fault request queue full. XREADY readback request skipped.");
+}
 
 static void Bms_Fault_Thread( void *parameter ) {
     (void)parameter;
@@ -296,12 +487,34 @@ static void Bms_Fault_Thread( void *parameter ) {
     };
     const rt_int32_t timeout = rt_tick_from_millisecond(750);
     rt_uint32_t previous_faults = 0u;
+    rt_bool_t stat_unavailable = RT_FALSE;
 
     for (;;) {
         rt_ubase_t recv_event;
-
-        if (rt_mb_recv(fault_mailbox, &recv_event, timeout) != RT_EOK) {
-            /* TODO: 接收超时后检查快照是否过期。 */
+        rt_err_t recv_result;
+        bms_fault_service_requests();   /* 检查本地FIFO是否有待处理命令(发给IO线程) */
+        recv_result = rt_mb_recv(fault_mailbox, &recv_event, timeout);
+        if (recv_result == -RT_ETIMEOUT) {
+            BatteryPackInfo_t batterySnap;
+            if (Bms_GetSnapShot(&batterySnap) != HAL_OK) {
+                LOG_ERROR("STAT timeout: snapshot read failed.");
+                continue;
+            }
+            if (!batterySnap.stat.afe_sys_stat_isValid) {
+                /* AFE 尚未初始化成功时，由初始化路径报告。 */
+                if (batterySnap.stat.afe_init_result == AFE_EOK && !stat_unavailable) {
+                    stat_unavailable = RT_TRUE;
+                    LOG_ERROR("SYS_STAT unavailable. Last read result: %u.", (unsigned)batterySnap.stat.afe_sys_stat_result);
+                }
+                continue;
+            }
+            if (batterySnap.stat.afe_sys_stat_result == AFE_EOK)
+                stat_unavailable = RT_FALSE;
+            recv_event = ((rt_ubase_t)BMS_FAULT_EVENT_GENERIC_UPLOAD << 28u) |      /* 用有效快照伪造一份事件复用下述检测逻辑。 */
+                         (rt_ubase_t)batterySnap.stat.afe_sys_stat;
+        } else if (recv_result != RT_EOK) {
+            LOG_ERROR("Fault mailbox receive failed: %d.", (int)recv_result);
+            rt_thread_mdelay(100u);
             continue;
         }
 
@@ -310,15 +523,47 @@ static void Bms_Fault_Thread( void *parameter ) {
                 const rt_uint32_t fault_mask = bms_evaluate((uint8_t)(recv_event & 0xFFu));
                 const rt_uint32_t new_faults = fault_mask & ~previous_faults;
                 rt_size_t i;
+                if (recv_result == RT_EOK)
+                    stat_unavailable = RT_FALSE;
                 previous_faults = fault_mask;
                 for (i = 0u; i < sizeof(handlers) / sizeof(handlers[0]); ++i) {
                     if (new_faults & handlers[i].mask)
-                        handlers[i].handler();
+                        handlers[i].handler();      /* 根据错误标志位置位情况.依次分发处理逻辑. */
                 }
                 break;
             }
-            case BMS_FAULT_EVENT_INIT_FAIL: break;
-            default:    break;
+            case BMS_FAULT_EVENT_INIT_FAIL: {
+                const AFEState_t ret = (AFEState_t)(recv_event & 0x00FFFFFFu);
+                LOG_ERROR("BMS Init Failed! Error Code: %x.", (unsigned)ret);
+                break;
+            }
+            case BMS_FAULT_EVENT_VERIFY_OUTPUTS_RESULT: {
+                const unsigned request_id = (unsigned)((recv_event >> 16u) & 0xFFu);
+                const unsigned result = (unsigned)((recv_event >> 8u) & 0xFFu);
+                const unsigned fet_enable = (unsigned)(recv_event & BMS_AFE_FET_ENABLE_MASK);
+                const unsigned balance_enable = (unsigned)((recv_event >> 2u) & BMS_AFE_CELLBAL_ENABLE_MASK);
+
+                if (bms_fault_transaction.pending && request_id == bms_fault_transaction.request_id &&
+                    bms_fault_requests[bms_fault_request_read].type == BMS_AFE_CMD_VERIFY_OUTPUTS) {
+                    /* 单笔事务Id与命令类型能够对应上.说明收到的回复确实是当前这笔事务的. */
+                    if (result != AFE_EOK && bms_fault_transaction.retry_count < BMS_FAULT_MAX_RETRIES) {  /* 远端未正确执行命令. */
+                        bms_fault_transaction.pending = RT_FALSE;
+                        ++bms_fault_transaction.retry_count;
+                        break;
+                    }
+                    bms_fault_finish_request(); /* 重试次数耗尽. 清掉请求. */
+                }
+
+                if (result != AFE_EOK)
+                    LOG_ERROR("AFE output readback failed. id=%u rc=%u", request_id, result);
+                else if (fet_enable != 0u || balance_enable != 0u)
+                    LOG_WARN("AFE outputs active. id=%u fet=0x%X balance=0x%X",
+                             request_id, fet_enable, balance_enable);
+                else
+                    LOG_INFO("AFE outputs off. id=%u", request_id);
+                break;
+            }
+            default:  LOG_WARN("Unknown Stat Code Detected.");   break;
         }
     }
 }

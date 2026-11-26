@@ -11,8 +11,9 @@
 #define  BMS_TEMP_SAMPLE_PERIOD_MS          (3000u)
 #define  BMS_CONSOLE_PERIOD_MS              (1000u)
 
-#define BMS_FAULT_EVENT_GENERIC_UPLOAD      (0x01u)
-#define BMS_FAULT_EVENT_INIT_FAIL           (0x02u)
+#define BMS_FAULT_EVENT_GENERIC_UPLOAD          (0x01u)
+#define BMS_FAULT_EVENT_INIT_FAIL               (0x02u)
+#define BMS_FAULT_EVENT_VERIFY_OUTPUTS_RESULT   (0x03u)
 
 #define FAULT_MASK_OCD                      (0x01u)
 #define FAULT_MASK_SCD                      (0x01u << 1)
@@ -59,10 +60,18 @@ typedef struct {
 } BatteryPackInfo_t;
 
 
-/* 由启动线程调用一次，HAL_OK 表示采样线程已启动。 */
-HAL_StatusTypeDef Bms_SampleTaskCreate( void );
+/* 由启动线程调用一次，创建命令队列并启动独占 AFE I2C 的采样线程。 */
+HAL_StatusTypeDef Bms_AfeIoThreadCreate( void );
 HAL_StatusTypeDef Bms_ConsoleThreadCreate( void );
 HAL_StatusTypeDef Bms_FaultThreadCreate( void );
+
+/* 异步请求回读控制位，模块分配请求号，结果由故障线程按号报告。
+ * timeout_ms 为单次寄存器读取的超时（1～20 ms）。
+ * HAL_OK 表示已入队并写入 request_id_out。HAL_BUSY 表示队列满，HAL_ERROR
+ * 表示参数错误或服务未就绪。失败时 request_id_out 指向的值保持原样。
+ * 请求号是可回绕的 8 位序号，调用方保存当前待回复的请求号。
+ */
+HAL_StatusTypeDef Bms_AfeRequestVerifyOutputs(uint32_t timeout_ms, uint8_t *request_id_out);
 
 /* 在线程中调用。HAL_OK 表示已写回完成有效期检查的快照。
  * 建议为每个调用方使用独立的输出对象。共享输出时，由调用方同步各处的读写。

@@ -7,12 +7,12 @@
 
 int main( void ) {
     HAL_StatusTypeDef res;
-    /* The sampling thread can report an AFE initialization failure immediately. */
+    /* The AFE I/O thread can report an initialization failure immediately. */
     res = Bms_FaultThreadCreate();
     if (res != HAL_OK)
         return 1;
 
-    res = Bms_SampleTaskCreate();
+    res = Bms_AfeIoThreadCreate();
     if (res != HAL_OK)
         return 1;
 

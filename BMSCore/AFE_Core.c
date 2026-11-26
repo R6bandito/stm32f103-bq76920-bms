@@ -201,6 +201,25 @@ AFEState_t AFE_GetStatus(uint8_t *status, uint32_t timeout_ms) {
     return AFE_EOK;
 }
 
+AFEState_t AFE_ReadOutputState(uint8_t *sys_ctrl2, uint8_t *cellbal1, uint32_t timeout_ms) {
+    BqStatus state;
+    uint8_t ctrl;
+    uint8_t balance;
+    if (sys_ctrl2 == NULL || cellbal1 == NULL)
+        return AFE_EPARAM;
+
+    state = BQ76920_ReadReg(BQ76920_REG_SYS_CTRL2, &ctrl, timeout_ms);
+    if (state != BQ_EOK)
+        return afe_err_handle(state);
+    state = BQ76920_ReadReg(BQ76920_REG_CELLBAL1, &balance, timeout_ms);
+    if (state != BQ_EOK)
+        return afe_err_handle(state);
+
+    *sys_ctrl2 = ctrl;
+    *cellbal1 = balance;
+    return AFE_EOK;
+}
+
 AFEState_t AFE_GetCellVoltage(CellIndex_t cell_index, uint16_t *voltage_mv, uint32_t timeout_ms) {
     if ((uint32_t)cell_index >= AFE_CELL_COUNT || voltage_mv == NULL)
         return AFE_EPARAM;

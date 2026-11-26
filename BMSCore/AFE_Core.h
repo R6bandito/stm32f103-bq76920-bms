@@ -52,6 +52,9 @@ AFEState_t AFE_Init(uint32_t timeout_ms);
 /* 读取原始SYS_STAT状态字节；不自动清除故障或CC_READY。 */
 AFEState_t AFE_GetStatus(uint8_t *status, uint32_t timeout_ms);
 
+/* 回读 SYS_CTRL2 和 CELLBAL1；两个输出只在读完整组后更新。 */
+AFEState_t AFE_ReadOutputState(uint8_t *sys_ctrl2, uint8_t *cellbal1, uint32_t timeout_ms);
+
 /* 使用CELL_INDEX_1～CELL_INDEx_5枚举（数值0～4）；输出单位mV。 */
 AFEState_t AFE_GetCellVoltage(CellIndex_t cell_index, uint16_t *voltage_mv,
                              uint32_t timeout_ms);
